@@ -802,7 +802,7 @@ async def search(
         f"brand.ilike.{pattern},"
         f"main_category.ilike.{pattern},"
         f"sub_category.ilike.{pattern},"
-        f"product_type.ilike.{pattern},"
+        f"product_type.ilike.{pattern}"
         
     )
 
