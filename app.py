@@ -803,8 +803,7 @@ async def search(
         f"main_category.ilike.{pattern},"
         f"sub_category.ilike.{pattern},"
         f"product_type.ilike.{pattern},"
-        f"search_tags.ilike.{pattern},"
-        f"seo_keywords.ilike.{pattern}"
+        
     )
 
     # PostgREST expects `or=(cond1,cond2,...)` as a single query param.
