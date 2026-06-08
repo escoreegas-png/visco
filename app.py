@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -152,64 +152,72 @@ class SupabaseClient:
         if self._client:
             await self._client.aclose()
             self._client = None
-   async def _request(
-    self,
-    method: str,
-    path: str,
-    params: dict[str, Any] | None = None,
-    retries: int = 2,
-) -> tuple[list[dict[str, Any]], int]:
-    if not self._client or not self._base:
-        raise HTTPException(status_code=503, detail="Database unavailable.")
 
-    url = f"{self._base}{path}"
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        retries: int = 2,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not self._client or not self._base:
+            raise HTTPException(status_code=503, detail="Database unavailable.")
 
-    # PostgREST's `or` / `and` filters use a syntax — `(col.op.val,col.op.val)` —
-    # that httpx's default encoder breaks. Build the query string manually
-    # so parentheses, commas, and asterisks pass through unmolested.
-    from urllib.parse import quote
-    query_parts: list[str] = []
-    if params:
-        for key, value in params.items():
-            # `safe` keeps the PostgREST-significant characters literal.
-            query_parts.append(f"{quote(str(key), safe='')}={quote(str(value), safe='(),.*:')}")
-    query_string = "&".join(query_parts)
-    full_url = f"{url}?{query_string}" if query_string else url
+        url = f"{self._base}{path}"
 
-    last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            resp = await self._client.request(method, full_url)
-            if resp.status_code >= 500:
-                raise httpx.HTTPStatusError(
-                    "server error", request=resp.request, response=resp
+        # PostgREST's `or` / `and` filters use a syntax — `(col.op.val,col.op.val)` —
+        # that httpx's default encoder breaks. Build the query string manually
+        # so parentheses, commas, and asterisks pass through unmolested.
+        query_parts: list[str] = []
+        if params:
+            for key, value in params.items():
+                # `safe` keeps the PostgREST-significant characters literal.
+                query_parts.append(
+                    f"{quote(str(key), safe='')}={quote(str(value), safe='(),.*:')}"
                 )
-            if resp.status_code >= 400:
-                logger.warning(
-                    "Supabase %s %s -> %s | body=%s",
-                    method, path, resp.status_code, resp.text[:300]
-                )
-                raise HTTPException(status_code=502, detail="Upstream error.")
-            content_range = resp.headers.get("content-range", "")
-            total = 0
-            if "/" in content_range:
-                try:
-                    total = int(content_range.split("/")[-1])
-                except ValueError:
-                    total = 0
-            data = resp.json() if resp.content else []
-            if not isinstance(data, list):
-                data = [data] if data else []
-            return data, total
-        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-            last_exc = exc
-            if attempt < retries:
-                await asyncio.sleep(0.3 * (attempt + 1))
-                continue
-            logger.error("Supabase request failed: %s", exc)
-            raise HTTPException(status_code=503, detail="Database temporarily unavailable.")
-    raise HTTPException(status_code=503, detail=str(last_exc) if last_exc else "DB error")
+        query_string = "&".join(query_parts)
+        full_url = f"{url}?{query_string}" if query_string else url
 
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                resp = await self._client.request(method, full_url)
+                if resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        "server error", request=resp.request, response=resp
+                    )
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Supabase %s %s -> %s | body=%s",
+                        method,
+                        path,
+                        resp.status_code,
+                        resp.text[:300],
+                    )
+                    raise HTTPException(status_code=502, detail="Upstream error.")
+                content_range = resp.headers.get("content-range", "")
+                total = 0
+                if "/" in content_range:
+                    try:
+                        total = int(content_range.split("/")[-1])
+                    except ValueError:
+                        total = 0
+                data = resp.json() if resp.content else []
+                if not isinstance(data, list):
+                    data = [data] if data else []
+                return data, total
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+                logger.error("Supabase request failed: %s", exc)
+                raise HTTPException(
+                    status_code=503, detail="Database temporarily unavailable."
+                )
+        raise HTTPException(
+            status_code=503, detail=str(last_exc) if last_exc else "DB error"
+        )
 
     async def select(
         self,
@@ -485,7 +493,10 @@ def _score_product(row: dict[str, Any], query: str, q_tokens: list[str]) -> floa
         keywords = " ".join(str(k) for k in keywords_parsed).lower()
     else:
         keywords = str(row.get("seo_keywords") or "").lower()
-    haystack_meta = f"{tags} {keywords} {row.get('main_category','')} {row.get('sub_category','')} {row.get('product_type','')}".lower()
+    haystack_meta = (
+        f"{tags} {keywords} {row.get('main_category','')} "
+        f"{row.get('sub_category','')} {row.get('product_type','')}"
+    ).lower()
 
     score = 0.0
     if query and query in title:
@@ -522,7 +533,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["X-XSS-Protection"] = "0"
-        # MutableHeaders supports __delitem__ but not pop(); guard with membership check.
         if "server" in response.headers:
             try:
                 del response.headers["server"]
@@ -650,7 +660,7 @@ def _ok(data: Any, **extra: Any) -> dict[str, Any]:
 # Admin auth dependency
 # ---------------------------------------------------------------------------
 def require_admin(x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key")) -> None:
-    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+    if not x_admin_key or not ADMIN_API_KEY or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=404, detail="Not found.")
 
 
@@ -758,6 +768,7 @@ async def get_product(normalized_product_id: str) -> dict[str, Any]:
     await cache.set(cache_key, response, ttl=CACHE_TTL_SECONDS)
     return response
 
+
 @app.get("/api/search")
 async def search(
     q: str = Query(..., min_length=1, max_length=120),
@@ -777,7 +788,11 @@ async def search(
     # Strip characters that would break the filter syntax.
     safe_q = re.sub(r"[,()*\\]", " ", query).strip()
     if not safe_q:
-        response = _ok([], pagination={"page": 1, "limit": limit, "total": 0, "pages": 0}, query=query)
+        response = _ok(
+            [],
+            pagination={"page": 1, "limit": limit, "total": 0, "pages": 0},
+            query=query,
+        )
         await cache.set(cache_key, response, ttl=SEARCH_CACHE_TTL)
         return response
 
@@ -793,8 +808,6 @@ async def search(
     )
 
     # PostgREST expects `or=(cond1,cond2,...)` as a single query param.
-    # Pass it through directly rather than via the filters dict so httpx doesn't
-    # mangle the parentheses/commas.
     candidates, _ = await db.select(
         columns=SAFE_COLUMNS,
         filters={"or": f"({or_clause})"},
