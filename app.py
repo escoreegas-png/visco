@@ -44,11 +44,10 @@ logger = logging.getLogger("comparator")
 # ---------------------------------------------------------------------------
 # Configuration (env-only; never expose to frontend)
 # ---------------------------------------------------------------------------
-SUPABASE_URL = "https://yacgfuyzwdcwevojffzd.supabase.co"
-SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhY2dmdXl6d2Rjd2V2b2pmZnpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTIyNjIxOCwiZXhwIjoyMDkwODAyMjE4fQ.y910mhGOsStJYp9sZAL-i8ucfAcL9YwsS9UnDHEZLIs"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 PORT = 8000
-
-ADMIN_API_KEY = "sb_secret_DjatsXvYAZiHbrhbbnC7mA_H4jew2qf"
 OFFER_SIGNING_SECRET = os.getenv("OFFER_SIGNING_SECRET", secrets.token_urlsafe(48))
 
 CORS_ALLOWED_ORIGINS = [
