@@ -4,3 +4,6 @@ gunicorn
 httpx
 pydantic
 python-multipart
+bcrypt==4.2.0
+pyjwt==2.9.0
+
