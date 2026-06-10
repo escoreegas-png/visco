@@ -1,6 +1,6 @@
 """
-Production-grade FastAPI backend for a product comparison website.
-Now with auth, wishlist, price alerts, and a stealth proxy layer.
+Production-grade FastAPI backend for Visco Compare.
+Adds: phone-exists check, no-verification password reset, wishlist hydration.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from urllib.parse import quote, urlparse
 import bcrypt
 import httpx
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -66,7 +66,8 @@ SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "60"))
 
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
-AUTH_RATE_LIMIT = int(os.getenv("AUTH_RATE_LIMIT", "10"))  # per minute per IP
+AUTH_RATE_LIMIT = int(os.getenv("AUTH_RATE_LIMIT", "10"))
+RESET_RATE_LIMIT = int(os.getenv("RESET_RATE_LIMIT", "5"))
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY not set — DB calls will fail.")
@@ -546,18 +547,18 @@ async def get_current_user(
     return {"id": user_id, "phone": payload.get("phone")}
 
 
-async def _auth_rate_limit(request: Request) -> None:
+async def _ip_rate_limit(request: Request, bucket_prefix: str, limit: int) -> None:
     ip = (
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "anon")
     )
-    key = f"auth:{ip}"
+    key = f"{bucket_prefix}:{ip}"
     now = time.time()
     window_start = now - 60
     async with _rate_lock:
         bucket = _rate_buckets[key]
         bucket[:] = [t for t in bucket if t > window_start]
-        if len(bucket) >= AUTH_RATE_LIMIT:
+        if len(bucket) >= limit:
             raise HTTPException(status_code=429, detail="Too many attempts. Try again soon.")
         bucket.append(now)
 
@@ -708,7 +709,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="API",
-    version="1.0.0",
+    version="1.1.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -769,6 +770,15 @@ class LoginBody(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class CheckPhoneBody(BaseModel):
+    phone: str = Field(min_length=8, max_length=20)
+
+
+class ResetPasswordBody(BaseModel):
+    phone: str = Field(min_length=8, max_length=20)
+    new_password: str = Field(min_length=4, max_length=128)
+
+
 class WishlistBody(BaseModel):
     product_id: str = Field(min_length=1, max_length=200)
 
@@ -799,9 +809,25 @@ async def favicon() -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Auth routes
 # ---------------------------------------------------------------------------
+@app.post("/auth/check-phone")
+async def auth_check_phone(body: CheckPhoneBody, request: Request) -> dict[str, Any]:
+    """Tell the client whether an account already exists for this phone."""
+    await _ip_rate_limit(request, "checkphone", 20)
+    phone = _normalize_phone(body.phone)
+    if not PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number.")
+    rows, _ = await db.select(
+        table=USERS_TABLE,
+        columns="id",
+        filters={"phone": f"eq.{phone}"},
+        limit=1,
+    )
+    return _ok({"exists": bool(rows)})
+
+
 @app.post("/auth/signup")
 async def auth_signup(body: SignupBody, request: Request) -> dict[str, Any]:
-    await _auth_rate_limit(request)
+    await _ip_rate_limit(request, "auth", AUTH_RATE_LIMIT)
 
     phone = _normalize_phone(body.phone)
     if not PHONE_RE.match(phone):
@@ -818,7 +844,10 @@ async def auth_signup(body: SignupBody, request: Request) -> dict[str, Any]:
         limit=1,
     )
     if existing:
-        raise HTTPException(status_code=409, detail="Phone already registered.")
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this phone already exists. Please log in instead.",
+        )
 
     pw_hash = _hash_password(body.password)
     user = await db.insert(
@@ -839,7 +868,7 @@ async def auth_signup(body: SignupBody, request: Request) -> dict[str, Any]:
 
 @app.post("/auth/login")
 async def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
-    await _auth_rate_limit(request)
+    await _ip_rate_limit(request, "auth", AUTH_RATE_LIMIT)
 
     phone = _normalize_phone(body.phone)
     if not PHONE_RE.match(phone):
@@ -852,11 +881,14 @@ async def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
         limit=1,
     )
     if not rows:
-        raise HTTPException(status_code=401, detail="Invalid phone or password.")
+        raise HTTPException(
+            status_code=404,
+            detail="No account found with this phone. Please sign up first.",
+        )
 
     user = rows[0]
     if not _verify_password(body.password, user.get("password_hash") or ""):
-        raise HTTPException(status_code=401, detail="Invalid phone or password.")
+        raise HTTPException(status_code=401, detail="Incorrect password.")
 
     try:
         await db.update(
@@ -865,7 +897,7 @@ async def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
             {"last_login_at": datetime.now(timezone.utc).isoformat()},
         )
     except Exception:
-        pass  # non-fatal
+        pass
 
     token = _create_token(str(user["id"]), phone)
     return _ok(
@@ -874,6 +906,41 @@ async def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
             "user": {"id": user["id"], "name": user["name"], "phone": user["phone"]},
         }
     )
+
+
+@app.post("/auth/reset-password")
+async def auth_reset_password(body: ResetPasswordBody, request: Request) -> dict[str, Any]:
+    """
+    No-verification password reset. Resets the password for the given phone
+    number directly if an account exists. (Use with care — for production-grade
+    security you'd want OTP verification.)
+    """
+    await _ip_rate_limit(request, "reset", RESET_RATE_LIMIT)
+
+    phone = _normalize_phone(body.phone)
+    if not PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number.")
+
+    rows, _ = await db.select(
+        table=USERS_TABLE,
+        columns="id,phone",
+        filters={"phone": f"eq.{phone}"},
+        limit=1,
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No account found with this phone number.",
+        )
+
+    user = rows[0]
+    pw_hash = _hash_password(body.new_password)
+    await db.update(
+        USERS_TABLE,
+        {"id": f"eq.{user['id']}"},
+        {"password_hash": pw_hash},
+    )
+    return _ok({"reset": True})
 
 
 @app.get("/auth/me")
@@ -910,14 +977,14 @@ async def auth_me(current: dict[str, Any] = Depends(get_current_user)) -> dict[s
             "stats": {
                 "wishlist": wl_total,
                 "alerts": al_total,
-                "saved": 0,  # placeholder for future "money saved" logic
+                "saved": 0,
             },
         }
     )
 
 
 # ---------------------------------------------------------------------------
-# User-facing wishlist & alerts
+# Wishlist & alerts
 # ---------------------------------------------------------------------------
 @app.get("/me/wishlist")
 async def my_wishlist(current: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
