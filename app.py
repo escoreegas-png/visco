@@ -1,9 +1,6 @@
 """
 Production-grade FastAPI backend for a product comparison website.
-
-Single-file architecture: everything lives in app.py.
-Database is READ-ONLY against an existing Supabase `products` table.
-Frontend never sees affiliate URLs, table names, keys, or raw schema.
+Now with auth, wishlist, price alerts, and a stealth proxy layer.
 """
 
 from __future__ import annotations
@@ -19,12 +16,14 @@ import secrets
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote, urlparse
 
+import bcrypt
 import httpx
+import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -42,35 +41,40 @@ logging.basicConfig(
 logger = logging.getLogger("comparator")
 
 # ---------------------------------------------------------------------------
-# Configuration (env-only; never expose to frontend)
+# Config
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-PORT = 8000
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(64))
+JWT_ALG = "HS256"
+JWT_EXPIRES_DAYS = 30
+PORT = int(os.getenv("PORT", "8000"))
 OFFER_SIGNING_SECRET = os.getenv("OFFER_SIGNING_SECRET", secrets.token_urlsafe(48))
 
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",") if o.strip()
 ]
 
-TABLE_NAME = "products"  # internal only — never returned to clients
+PRODUCTS_TABLE = "products"
+USERS_TABLE = "users"
+WISHLIST_TABLE = "user_wishlist"
+ALERTS_TABLE = "user_price_alerts"
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "60"))
 
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+AUTH_RATE_LIMIT = int(os.getenv("AUTH_RATE_LIMIT", "10"))  # per minute per IP
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY not set — DB calls will fail.")
 
 # ---------------------------------------------------------------------------
-# In-memory caches & analytics (process-local; replace with Redis at scale)
+# Caches & analytics
 # ---------------------------------------------------------------------------
 class TTLCache:
-    """Tiny async-safe TTL cache."""
-
     def __init__(self, default_ttl: int = 120, max_size: int = 2048) -> None:
         self._store: dict[str, tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
@@ -108,27 +112,22 @@ class TTLCache:
 
 cache = TTLCache(default_ttl=CACHE_TTL_SECONDS)
 
-# Offer registry: signed offer_id -> {url, store, product_id}
 _offer_registry: dict[str, dict[str, Any]] = {}
 _offer_lock = asyncio.Lock()
 
-# Analytics
 _search_analytics: dict[str, int] = defaultdict(int)
 _click_analytics: dict[str, int] = defaultdict(int)
 _click_log: list[dict[str, Any]] = []
 _MAX_CLICK_LOG = 5000
 
-# Rate limit buckets
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 _rate_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Supabase REST client (async, connection-reused)
+# Supabase client
 # ---------------------------------------------------------------------------
 class SupabaseClient:
-    """Minimal async Supabase REST client using PostgREST."""
-
     def __init__(self, url: str, key: str) -> None:
         self._base = f"{url}/rest/v1" if url else ""
         self._headers = {
@@ -136,7 +135,6 @@ class SupabaseClient:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Prefer": "count=exact",
         }
         self._client: httpx.AsyncClient | None = None
 
@@ -158,30 +156,35 @@ class SupabaseClient:
         method: str,
         path: str,
         params: dict[str, Any] | None = None,
+        body: Any | None = None,
+        prefer: str | None = None,
         retries: int = 2,
     ) -> tuple[list[dict[str, Any]], int]:
         if not self._client or not self._base:
             raise HTTPException(status_code=503, detail="Database unavailable.")
 
         url = f"{self._base}{path}"
-
-        # PostgREST's `or` / `and` filters use a syntax — `(col.op.val,col.op.val)` —
-        # that httpx's default encoder breaks. Build the query string manually
-        # so parentheses, commas, and asterisks pass through unmolested.
         query_parts: list[str] = []
         if params:
             for key, value in params.items():
-                # `safe` keeps the PostgREST-significant characters literal.
                 query_parts.append(
                     f"{quote(str(key), safe='')}={quote(str(value), safe='(),.*:')}"
                 )
         query_string = "&".join(query_parts)
         full_url = f"{url}?{query_string}" if query_string else url
 
+        headers = {}
+        if prefer:
+            headers["Prefer"] = prefer
+        else:
+            headers["Prefer"] = "count=exact"
+
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                resp = await self._client.request(method, full_url)
+                resp = await self._client.request(
+                    method, full_url, json=body, headers=headers
+                )
                 if resp.status_code >= 500:
                     raise httpx.HTTPStatusError(
                         "server error", request=resp.request, response=resp
@@ -194,6 +197,8 @@ class SupabaseClient:
                         resp.status_code,
                         resp.text[:300],
                     )
+                    if resp.status_code == 409:
+                        raise HTTPException(status_code=409, detail="Conflict.")
                     raise HTTPException(status_code=502, detail="Upstream error.")
                 content_range = resp.headers.get("content-range", "")
                 total = 0
@@ -221,6 +226,7 @@ class SupabaseClient:
 
     async def select(
         self,
+        table: str = PRODUCTS_TABLE,
         columns: str = "*",
         filters: dict[str, str] | None = None,
         order: str | None = None,
@@ -236,14 +242,38 @@ class SupabaseClient:
             params["limit"] = str(limit)
         if offset is not None:
             params["offset"] = str(offset)
-        return await self._request("GET", f"/{TABLE_NAME}", params=params)
+        return await self._request("GET", f"/{table}", params=params)
+
+    async def insert(self, table: str, row: dict[str, Any]) -> dict[str, Any]:
+        data, _ = await self._request(
+            "POST",
+            f"/{table}",
+            body=row,
+            prefer="return=representation",
+        )
+        return data[0] if data else {}
+
+    async def update(
+        self, table: str, filters: dict[str, str], patch: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        data, _ = await self._request(
+            "PATCH",
+            f"/{table}",
+            params=filters,
+            body=patch,
+            prefer="return=representation",
+        )
+        return data
+
+    async def delete(self, table: str, filters: dict[str, str]) -> None:
+        await self._request("DELETE", f"/{table}", params=filters, prefer="return=minimal")
 
 
 db = SupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 # ---------------------------------------------------------------------------
-# Helpers — parsing, sanitization, transformation
+# Helpers
 # ---------------------------------------------------------------------------
 SAFE_COLUMNS = (
     "title,image,rating,reviews,offers,price,price_history,"
@@ -254,7 +284,6 @@ SAFE_COLUMNS = (
 
 
 def _safe_json(value: Any) -> Any:
-    """Parse JSON safely; tolerate already-parsed structures and bad input."""
     if value is None:
         return None
     if isinstance(value, (list, dict)):
@@ -313,7 +342,6 @@ def _sign_offer_id(payload: str) -> str:
 
 
 async def _register_offer(affiliate_url: str, store: str, product_id: str) -> str:
-    """Generate a stable, opaque offer_id for an affiliate URL and store it server-side."""
     if not affiliate_url:
         return ""
     payload = f"{product_id}|{store}|{affiliate_url}"
@@ -334,7 +362,6 @@ async def _normalize_offers(
     fallback_url: str | None,
     product_id: str,
 ) -> list[dict[str, Any]]:
-    """Parse, dedupe, group by store (lowest price), sort ascending, hide URLs."""
     parsed = _safe_json(raw_offers) or []
     if isinstance(parsed, dict):
         parsed = [parsed]
@@ -393,7 +420,6 @@ async def _normalize_offers(
 
 
 def _normalize_price_history(raw: Any) -> list[dict[str, Any]]:
-    """Return graph-ready, sorted, validated [{date, price, store?}] list."""
     parsed = _safe_json(raw) or []
     if isinstance(parsed, dict):
         parsed = [{"date": k, "price": v} for k, v in parsed.items()]
@@ -423,7 +449,6 @@ def _normalize_price_history(raw: Any) -> list[dict[str, Any]]:
 
 
 async def _transform_product(row: dict[str, Any], include_extras: bool = True) -> dict[str, Any]:
-    """Transform a raw DB row into a safe public product object."""
     product_id = str(row.get("normalized_product_id") or "")
     offers = await _normalize_offers(
         row.get("offers"),
@@ -465,7 +490,80 @@ async def _transform_product(row: dict[str, Any], include_extras: bool = True) -
 
 
 # ---------------------------------------------------------------------------
-# Search engine — fuzzy, ranked, suggestion-friendly
+# Auth helpers
+# ---------------------------------------------------------------------------
+PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+
+
+def _normalize_phone(phone: str) -> str:
+    p = re.sub(r"[\s\-()]", "", phone or "")
+    if not p.startswith("+") and len(p) == 10:
+        p = "+91" + p
+    return p
+
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _create_token(user_id: str, phone: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "phone": phone,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=JWT_EXPIRES_DAYS)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def _decode_token(token: str) -> dict[str, Any]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid session.")
+
+
+async def get_current_user(
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = _decode_token(token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid session.")
+    return {"id": user_id, "phone": payload.get("phone")}
+
+
+async def _auth_rate_limit(request: Request) -> None:
+    ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "anon")
+    )
+    key = f"auth:{ip}"
+    now = time.time()
+    window_start = now - 60
+    async with _rate_lock:
+        bucket = _rate_buckets[key]
+        bucket[:] = [t for t in bucket if t > window_start]
+        if len(bucket) >= AUTH_RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Too many attempts. Try again soon.")
+        bucket.append(now)
+
+
+# ---------------------------------------------------------------------------
+# Search engine
 # ---------------------------------------------------------------------------
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -522,7 +620,7 @@ def _score_product(row: dict[str, Any], query: str, q_tokens: list[str]) -> floa
 
 
 # ---------------------------------------------------------------------------
-# Middleware: security headers + rate limiting + access log
+# Middleware
 # ---------------------------------------------------------------------------
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Any]]):
@@ -609,7 +707,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Product Comparator API",
+    title="API",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
@@ -617,7 +715,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Middleware order matters: outermost first
 app.add_middleware(AccessLogMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RateLimitMiddleware)
@@ -626,15 +723,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOWED_ORIGINS or ["*"],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
     max_age=600,
 )
 
 
-# ---------------------------------------------------------------------------
-# Global error handlers
-# ---------------------------------------------------------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException):
     return JSONResponse(
@@ -656,24 +750,36 @@ def _ok(data: Any, **extra: Any) -> dict[str, Any]:
     return {"success": True, "data": data, **extra}
 
 
-# ---------------------------------------------------------------------------
-# Admin auth dependency
-# ---------------------------------------------------------------------------
 def require_admin(x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key")) -> None:
     if not x_admin_key or not ADMIN_API_KEY or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=404, detail="Not found.")
 
 
 # ---------------------------------------------------------------------------
-# Pydantic response shapes (documentation only — endpoints return dicts)
+# Pydantic models
 # ---------------------------------------------------------------------------
-class HealthResponse(BaseModel):
-    success: bool = True
-    data: dict[str, Any] = Field(default_factory=dict)
+class SignupBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    phone: str = Field(min_length=8, max_length=20)
+    password: str = Field(min_length=4, max_length=128)
+
+
+class LoginBody(BaseModel):
+    phone: str = Field(min_length=8, max_length=20)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class WishlistBody(BaseModel):
+    product_id: str = Field(min_length=1, max_length=200)
+
+
+class AlertBody(BaseModel):
+    product_id: str = Field(min_length=1, max_length=200)
+    target_price: float = Field(gt=0, lt=10_000_000)
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -681,8 +787,6 @@ async def health() -> dict[str, Any]:
         {
             "status": "ok",
             "time": datetime.now(timezone.utc).isoformat(),
-            "cache_size": cache.size(),
-            "offers_registered": len(_offer_registry),
         }
     )
 
@@ -692,6 +796,232 @@ async def favicon() -> JSONResponse:
     return JSONResponse(status_code=204, content=None)
 
 
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+@app.post("/auth/signup")
+async def auth_signup(body: SignupBody, request: Request) -> dict[str, Any]:
+    await _auth_rate_limit(request)
+
+    phone = _normalize_phone(body.phone)
+    if not PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number.")
+
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name required.")
+
+    existing, _ = await db.select(
+        table=USERS_TABLE,
+        columns="id",
+        filters={"phone": f"eq.{phone}"},
+        limit=1,
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Phone already registered.")
+
+    pw_hash = _hash_password(body.password)
+    user = await db.insert(
+        USERS_TABLE,
+        {"name": name, "phone": phone, "password_hash": pw_hash},
+    )
+    if not user:
+        raise HTTPException(status_code=500, detail="Could not create account.")
+
+    token = _create_token(str(user["id"]), phone)
+    return _ok(
+        {
+            "token": token,
+            "user": {"id": user["id"], "name": user["name"], "phone": user["phone"]},
+        }
+    )
+
+
+@app.post("/auth/login")
+async def auth_login(body: LoginBody, request: Request) -> dict[str, Any]:
+    await _auth_rate_limit(request)
+
+    phone = _normalize_phone(body.phone)
+    if not PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number.")
+
+    rows, _ = await db.select(
+        table=USERS_TABLE,
+        columns="id,name,phone,password_hash",
+        filters={"phone": f"eq.{phone}"},
+        limit=1,
+    )
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid phone or password.")
+
+    user = rows[0]
+    if not _verify_password(body.password, user.get("password_hash") or ""):
+        raise HTTPException(status_code=401, detail="Invalid phone or password.")
+
+    try:
+        await db.update(
+            USERS_TABLE,
+            {"id": f"eq.{user['id']}"},
+            {"last_login_at": datetime.now(timezone.utc).isoformat()},
+        )
+    except Exception:
+        pass  # non-fatal
+
+    token = _create_token(str(user["id"]), phone)
+    return _ok(
+        {
+            "token": token,
+            "user": {"id": user["id"], "name": user["name"], "phone": user["phone"]},
+        }
+    )
+
+
+@app.get("/auth/me")
+async def auth_me(current: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    rows, _ = await db.select(
+        table=USERS_TABLE,
+        columns="id,name,phone,created_at,last_login_at",
+        filters={"id": f"eq.{current['id']}"},
+        limit=1,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user = rows[0]
+
+    wl_rows, wl_total = await db.select(
+        table=WISHLIST_TABLE,
+        columns="id",
+        filters={"user_id": f"eq.{current['id']}"},
+        limit=1,
+    )
+    al_rows, al_total = await db.select(
+        table=ALERTS_TABLE,
+        columns="id",
+        filters={"user_id": f"eq.{current['id']}", "active": "eq.true"},
+        limit=1,
+    )
+
+    return _ok(
+        {
+            "id": user["id"],
+            "name": user["name"],
+            "phone": user["phone"],
+            "createdAt": user.get("created_at"),
+            "stats": {
+                "wishlist": wl_total,
+                "alerts": al_total,
+                "saved": 0,  # placeholder for future "money saved" logic
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# User-facing wishlist & alerts
+# ---------------------------------------------------------------------------
+@app.get("/me/wishlist")
+async def my_wishlist(current: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    rows, _ = await db.select(
+        table=WISHLIST_TABLE,
+        columns="product_id,created_at",
+        filters={"user_id": f"eq.{current['id']}"},
+        order="created_at.desc.nullslast",
+        limit=200,
+    )
+    if not rows:
+        return _ok([])
+
+    ids = list({r["product_id"] for r in rows if r.get("product_id")})
+    if not ids:
+        return _ok([])
+
+    or_clause = ",".join(f"normalized_product_id.eq.{pid}" for pid in ids)
+    products, _ = await db.select(
+        table=PRODUCTS_TABLE,
+        columns=SAFE_COLUMNS,
+        filters={"or": f"({or_clause})"},
+        limit=len(ids),
+    )
+    transformed = [await _transform_product(p, include_extras=True) for p in products]
+    return _ok(transformed)
+
+
+@app.post("/me/wishlist")
+async def add_wishlist(
+    body: WishlistBody, current: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    if not re.match(r"^[A-Za-z0-9_\-:.]{1,200}$", body.product_id):
+        raise HTTPException(status_code=400, detail="Invalid product id.")
+    try:
+        await db.insert(
+            WISHLIST_TABLE,
+            {"user_id": current["id"], "product_id": body.product_id},
+        )
+    except HTTPException as e:
+        if e.status_code != 409:
+            raise
+    return _ok({"added": True})
+
+
+@app.delete("/me/wishlist/{product_id}")
+async def remove_wishlist(
+    product_id: str, current: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    if not re.match(r"^[A-Za-z0-9_\-:.]{1,200}$", product_id):
+        raise HTTPException(status_code=400, detail="Invalid product id.")
+    await db.delete(
+        WISHLIST_TABLE,
+        {"user_id": f"eq.{current['id']}", "product_id": f"eq.{product_id}"},
+    )
+    return _ok({"removed": True})
+
+
+@app.get("/me/alerts")
+async def my_alerts(current: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    rows, _ = await db.select(
+        table=ALERTS_TABLE,
+        columns="id,product_id,target_price,active,created_at",
+        filters={"user_id": f"eq.{current['id']}"},
+        order="created_at.desc.nullslast",
+        limit=200,
+    )
+    return _ok(rows)
+
+
+@app.post("/me/alerts")
+async def add_alert(
+    body: AlertBody, current: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    if not re.match(r"^[A-Za-z0-9_\-:.]{1,200}$", body.product_id):
+        raise HTTPException(status_code=400, detail="Invalid product id.")
+    row = await db.insert(
+        ALERTS_TABLE,
+        {
+            "user_id": current["id"],
+            "product_id": body.product_id,
+            "target_price": body.target_price,
+            "active": True,
+        },
+    )
+    return _ok(row)
+
+
+@app.delete("/me/alerts/{alert_id}")
+async def remove_alert(
+    alert_id: str, current: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    if not re.match(r"^[A-Za-z0-9\-]{1,80}$", alert_id):
+        raise HTTPException(status_code=400, detail="Invalid alert id.")
+    await db.delete(
+        ALERTS_TABLE,
+        {"id": f"eq.{alert_id}", "user_id": f"eq.{current['id']}"},
+    )
+    return _ok({"removed": True})
+
+
+# ---------------------------------------------------------------------------
+# Product routes
+# ---------------------------------------------------------------------------
 @app.get("/api/products")
 async def list_products(
     page: int = Query(1, ge=1, le=10_000),
@@ -784,8 +1114,6 @@ async def search(
     if cached:
         return cached
 
-    # Sanitize: PostgREST `or` filter uses commas as separators and parens as grouping.
-    # Strip characters that would break the filter syntax.
     safe_q = re.sub(r"[,()*\\]", " ", query).strip()
     if not safe_q:
         response = _ok(
@@ -803,10 +1131,8 @@ async def search(
         f"main_category.ilike.{pattern},"
         f"sub_category.ilike.{pattern},"
         f"product_type.ilike.{pattern}"
-        
     )
 
-    # PostgREST expects `or=(cond1,cond2,...)` as a single query param.
     candidates, _ = await db.select(
         columns=SAFE_COLUMNS,
         filters={"or": f"({or_clause})"},
@@ -856,10 +1182,7 @@ async def categories() -> dict[str, Any]:
     if cached:
         return cached
 
-    rows, _ = await db.select(
-        columns="main_category,sub_category",
-        limit=10_000,
-    )
+    rows, _ = await db.select(columns="main_category,sub_category", limit=10_000)
     tree: dict[str, set[str]] = defaultdict(set)
     for r in rows:
         main = (r.get("main_category") or "").strip()
@@ -869,7 +1192,7 @@ async def categories() -> dict[str, Any]:
         if sub:
             tree[main].add(sub)
         else:
-            tree[main]  # ensure key exists
+            tree[main]
 
     data = [
         {"category": main, "subcategories": sorted(subs)}
@@ -1084,12 +1407,11 @@ async def affiliate_redirect(offer_id: str, request: Request) -> RedirectRespons
         del _click_log[: len(_click_log) - _MAX_CLICK_LOG]
 
     target = entry["url"]
-    logger.info("Affiliate redirect: %s -> %s", offer_id, entry.get("store"))
     return RedirectResponse(url=target, status_code=302)
 
 
 # ---------------------------------------------------------------------------
-# Admin (hidden — requires X-Admin-Key header; returns 404 if missing/invalid)
+# Admin
 # ---------------------------------------------------------------------------
 @app.get("/admin/stats", dependencies=[Depends(require_admin)])
 async def admin_stats() -> dict[str, Any]:
@@ -1101,57 +1423,6 @@ async def admin_stats() -> dict[str, Any]:
             "offers_registered": len(_offer_registry),
             "tracked_searches": len(_search_analytics),
             "tracked_clicks": len(_click_analytics),
-        }
-    )
-
-
-@app.get("/admin/products", dependencies=[Depends(require_admin)])
-async def admin_products(
-    page: int = Query(1, ge=1, le=10_000),
-    limit: int = Query(50, ge=1, le=200),
-) -> dict[str, Any]:
-    offset = (page - 1) * limit
-    rows, total = await db.select(
-        columns=SAFE_COLUMNS + ",url,affiliate_url",
-        order="created_at.desc.nullslast",
-        limit=limit,
-        offset=offset,
-    )
-    return _ok(
-        rows,
-        pagination={
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "pages": (total + limit - 1) // limit if limit else 1,
-        },
-    )
-
-
-@app.get("/admin/search-analytics", dependencies=[Depends(require_admin)])
-async def admin_search_analytics(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
-    top = sorted(_search_analytics.items(), key=lambda kv: kv[1], reverse=True)[:limit]
-    return _ok([{"query": q, "count": c} for q, c in top])
-
-
-@app.get("/admin/click-analytics", dependencies=[Depends(require_admin)])
-async def admin_click_analytics(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
-    top = sorted(_click_analytics.items(), key=lambda kv: kv[1], reverse=True)[:limit]
-    enriched = []
-    for offer_id, count in top:
-        entry = _offer_registry.get(offer_id, {})
-        enriched.append(
-            {
-                "offerId": offer_id,
-                "clicks": count,
-                "store": entry.get("store"),
-                "productId": entry.get("product_id"),
-            }
-        )
-    return _ok(
-        {
-            "top_offers": enriched,
-            "recent": _click_log[-min(limit, len(_click_log)) :],
         }
     )
 
